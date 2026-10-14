@@ -18,8 +18,22 @@ import runpod
 from audio_separator.separator import Separator
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/models")
-HF = "https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main"
-CKPT, YAML = "becruily_deux.ckpt", "config_deux_becruily_mel_band_roformer.yaml"
+# SEP_MODEL (template env) picks this endpoint's model: "deux" (default, 2 stems) or
+# "sw6" (BS-RoFormer SW, 6 stems; weight license unknown -> private/personal use only).
+SEP_MODEL = os.environ.get("SEP_MODEL", "deux")
+MODELS = {
+    "deux": dict(label="becruily-deux", ckpt="becruily_deux.ckpt",
+                 yaml="config_deux_becruily_mel_band_roformer.yaml",
+                 urls=("https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/becruily_deux.ckpt",
+                       "https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/config_deux_becruily.yaml"),
+                 stems=("instrumental", "vocals")),
+    "sw6": dict(label="bs-roformer-sw-6stem", ckpt="BS-Rofo-SW-Fixed.ckpt", yaml="BS-Rofo-SW-Fixed.yaml",
+                urls=("https://huggingface.co/FractalSurfer/BS-RoFormer-SW-6stem/resolve/main/BS-Rofo-SW-Fixed.ckpt",
+                      "https://huggingface.co/FractalSurfer/BS-RoFormer-SW-6stem/resolve/main/BS-Rofo-SW-Fixed.yaml"),
+                stems=("bass", "drums", "other", "vocals", "guitar", "piano")),
+}
+M = MODELS[SEP_MODEL]
+CKPT, YAML = M["ckpt"], M["yaml"]
 UA = {"User-Agent": "karaoke-separator/1.0"}
 OUT = "/tmp/sep_out"
 
@@ -34,14 +48,14 @@ def fetch(url, dst, timeout=600):
 def load():
     os.makedirs(MODEL_DIR, exist_ok=True)
     t = time.time()
-    for name, src in ((CKPT, f"{HF}/becruily_deux.ckpt"), (YAML, f"{HF}/config_deux_becruily.yaml")):
+    for name, src in zip((CKPT, YAML), M["urls"]):
         p = os.path.join(MODEL_DIR, name)
         if not os.path.exists(p):
             fetch(src, p)
     t_dl = time.time() - t
     s = Separator(model_file_dir=MODEL_DIR, output_dir=OUT, output_format="FLAC")
     # audio-separator 0.47 has no registry entry for deux: hand it the local files.
-    s.download_model_files = lambda f: (CKPT, "MDXC", "becruily deux", os.path.join(MODEL_DIR, CKPT), YAML)
+    s.download_model_files = lambda f: (CKPT, "MDXC", M["label"], os.path.join(MODEL_DIR, CKPT), YAML)
     s.load_model(CKPT)
     print(f"model ready: download {t_dl:.1f}s, total {time.time()-t:.1f}s, "
           f"cuda={torch.cuda.is_available()}", flush=True)
@@ -85,18 +99,22 @@ def handler(job):
         stems = {}
         for f in files:
             p = f if os.path.isabs(f) else os.path.join(OUT, f)
-            stems["vocals" if "vocal" in os.path.basename(p).lower() else "instrumental"] = p
-        if set(stems) != {"vocals", "instrumental"}:
+            b = os.path.basename(p).lower()
+            if SEP_MODEL == "deux":
+                stems["vocals" if "vocal" in b else "instrumental"] = p
+            else:
+                stems.update({k: p for k in M["stems"] if f"({k})" in b})
+        if set(stems) != set(M["stems"]):
             return {"error": f"unexpected stems {list(stems)}"}
-        out = {"model": "becruily-deux", "gpu": GPU, "separate_seconds": round(dt, 2),
+        out = {"model": M["label"], "gpu": GPU, "separate_seconds": round(dt, 2),
                "audio_seconds": round(info.duration, 2) if info else None}
         up = inp.get("upload") or {}
-        if up.get("instrumental") and up.get("vocals"):
+        if SEP_MODEL == "deux" and up.get("instrumental") and up.get("vocals"):
             for k in ("instrumental", "vocals"):
                 put(up[k], stems[k])
             out["uploaded"] = True
         else:
-            for k in ("instrumental", "vocals"):
+            for k in M["stems"]:
                 with open(stems[k], "rb") as f:
                     out[k + "_b64"] = base64.b64encode(f.read()).decode()
             out["uploaded"] = False
