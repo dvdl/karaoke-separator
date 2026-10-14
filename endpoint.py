@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Runpod serverless endpoint for deux: create | status | test FILE | off | on.
+"""Runpod serverless endpoint for deux: create | status | gpus | test FILE | off | on.
 Key from ~/ClaudeCode/maaravi-analytics/.env (RUNPOD_API_KEY, never printed).
 Guards: workersMax 1, workersMin 0, idleTimeout 5 s, executionTimeout 300 s;
 `off` sets workersMax 0 (the kill switch)."""
@@ -10,8 +10,14 @@ ROOT = Path(__file__).resolve().parent
 KEY = dict(re.findall(r"^([A-Z_]+)=(.*)$", (Path.home() / "ClaudeCode/maaravi-analytics/.env").read_text(), re.M))["RUNPOD_API_KEY"].strip().strip('"')
 IDFILE = ROOT / ".endpoint_id"
 IMAGE = "ghcr.io/dvdl/karaoke-separator:b5c0e162452d123bd5af4a48c7a77cb1d0cd5f90"
-GPUS = ["NVIDIA RTX A4000", "NVIDIA RTX A4500", "NVIDIA RTX 4000 Ada Generation",
-        "NVIDIA RTX A5000", "NVIDIA GeForce RTX 3090", "NVIDIA L4"]   # 16-24 GB
+GPUS = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090", "NVIDIA RTX A5000",
+        "NVIDIA RTX A4500", "NVIDIA L4"]   # fast, full (non-MIG) GPUs only
+# REST gpuTypeIds maps to whole pools (AMPERE_16/AMPERE_24/ADA_24), which also hold slow
+# cards and the "RTX PRO 6000 Blackwell ... MIG 1g.24gb" slice. `gpus` saves pools plus
+# explicit "-<type>" exclusions so only GPUS can ever be scheduled.
+POOLS = ["ADA_24", "AMPERE_24", "AMPERE_16"]
+EXCLUDE = ["NVIDIA RTX 2000 Ada Generation", "NVIDIA RTX 4000 Ada Generation", "NVIDIA RTX A4000",
+           "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"]
 UA = "karaoke-separator-admin/1.0"   # Python's default UA gets Cloudflare 1010
 
 
@@ -42,6 +48,7 @@ def create():
     print("endpoint", c, e.get("id") if isinstance(e, dict) else e)
     if c not in (200, 201): sys.exit(1)
     IDFILE.write_text(f"{e['id']} {t['id']}\n")
+    gpus()
 
 
 def status():
@@ -53,6 +60,16 @@ def status():
 
 def setmax(n):
     c, e = rest("PATCH", f"/endpoints/{eid()}", {"workersMax": n}); print("workersMax ->", n, c)
+
+
+def gpus():
+    ids = ",".join(POOLS + ["-" + g for g in EXCLUDE])
+    q = "mutation($i:EndpointInput!){saveEndpoint(input:$i){id gpuIds workersMax workersMin idleTimeout}}"
+    c, r = call("POST", "https://api.runpod.io/graphql", {"query": q, "variables": {"i": {
+        "id": eid(), "name": "karaoke-separator-deux", "templateId": IDFILE.read_text().split()[1], "gpuIds": ids,
+        "gpuCount": 1, "workersMin": 0, "workersMax": 1, "idleTimeout": 5, "scalerType": "QUEUE_DELAY",
+        "scalerValue": 4, "flashBootType": "FLASHBOOT"}}})
+    print(c, r)
 
 
 def test(path):
@@ -78,5 +95,5 @@ def test(path):
 
 if __name__ == "__main__":
     cmd = sys.argv[1]
-    {"create": create, "status": status, "off": lambda: setmax(0), "on": lambda: setmax(1),
+    {"create": create, "status": status, "off": lambda: setmax(0), "on": lambda: setmax(1), "gpus": gpus,
      "test": lambda: test(sys.argv[2])}[cmd]()
