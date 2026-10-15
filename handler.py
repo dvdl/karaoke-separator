@@ -17,6 +17,8 @@ import torch
 import runpod
 from audio_separator.separator import Separator
 
+from gpucheck import is_mig
+
 MODEL_DIR = os.environ.get("MODEL_DIR", "/models")
 # SEP_MODEL (template env) picks this endpoint's model: "deux" (default, 2 stems) or
 # "sw6" (BS-RoFormer SW, 6 stems; weight license unknown -> private/personal use only).
@@ -27,6 +29,7 @@ MODELS = {
                  urls=("https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/becruily_deux.ckpt",
                        "https://huggingface.co/becruily/mel-band-roformer-deux/resolve/main/config_deux_becruily.yaml"),
                  stems=("instrumental", "vocals")),
+    # NO stated licence for weights -> private/personal use only, not redistributed, fetched at cold start
     "sw6": dict(label="bs-roformer-sw-6stem", ckpt="BS-Rofo-SW-Fixed.ckpt", yaml="BS-Rofo-SW-Fixed.yaml",
                 urls=("https://huggingface.co/FractalSurfer/BS-RoFormer-SW-6stem/resolve/main/BS-Rofo-SW-Fixed.ckpt",
                       "https://huggingface.co/FractalSurfer/BS-RoFormer-SW-6stem/resolve/main/BS-Rofo-SW-Fixed.yaml"),
@@ -62,8 +65,12 @@ def load():
     return s
 
 
-SEP = load()
 GPU = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
+if is_mig(GPU):
+    print(f"refused: MIG GPU {GPU}", flush=True)
+    SEP = None
+else:
+    SEP = load()
 
 
 def put(url, path):
@@ -77,6 +84,8 @@ def put(url, path):
 
 
 def handler(job):
+    if is_mig(GPU):
+        return {"error": f"refused: MIG GPU {GPU}", "refused_gpu": GPU, "gpu": GPU}
     inp = job.get("input") or {}
     work = tempfile.mkdtemp(prefix="job_")
     shutil.rmtree(OUT, ignore_errors=True); os.makedirs(OUT)
@@ -106,6 +115,10 @@ def handler(job):
                 stems.update({k: p for k in M["stems"] if f"({k})" in b})
         if set(stems) != set(M["stems"]):
             return {"error": f"unexpected stems {list(stems)}"}
+        if SEP_MODEL == "sw6":
+            for p in stems.values():
+                d, sr = sf.read(p, dtype="float32")
+                sf.write(p, d, sr, format="FLAC", subtype="PCM_16")
         out = {"model": M["label"], "gpu": GPU, "separate_seconds": round(dt, 2),
                "audio_seconds": round(info.duration, 2) if info else None}
         up = inp.get("upload") or {}

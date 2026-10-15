@@ -7,5 +7,6 @@ RUN apt-get update -qq && apt-get install -y -qq ffmpeg && rm -rf /var/lib/apt/l
 RUN pip install --no-cache-dir uv && UV_HTTP_TIMEOUT=600 uv pip install --system --no-cache \
       "audio-separator[cpu]==0.47.0" audioread "runpod>=1.7" \
  && python -c "import torch; print('torch', torch.__version__)"
+COPY gpucheck.py /gpucheck.py
 COPY handler.py /handler.py
 CMD ["python", "-u", "/handler.py"]
