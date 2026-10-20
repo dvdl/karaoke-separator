@@ -4,8 +4,22 @@ set -u
 MAX=${MAX_MINUTES:-45}
 # ssh sessions do not see the container env: take RUNPOD_POD_ID / the pod-scoped key from PID 1
 eval "$(tr '\0' '\n' < /proc/1/environ | grep -E '^(RUNPOD_(API_KEY|POD_ID)|MAX_MINUTES)=' | sed 's/^/export /')"
-MAX=${MAX_MINUTES:-$MAX}
-nohup sh -c "sleep $((MAX*60)); runpodctl remove pod $RUNPOD_POD_ID || runpodctl stop pod $RUNPOD_POD_ID; kill 1" >/root/selfkill.log 2>&1 &
+export MAX=${MAX_MINUTES:-$MAX}
+nohup bash -c '
+sleep $((MAX * 60))
+status=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE -H "Authorization: Bearer $RUNPOD_API_KEY" "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID")
+echo "DELETE status: $status"
+if [ "$status" != "200" ] && [ "$status" != "204" ]; then
+    status=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer $RUNPOD_API_KEY" -H "Content-Type: application/json" -d "{\"action\":\"stop\"}" "https://api.runpod.io/v2/pods/$RUNPOD_POD_ID/action")
+    echo "POST stop status: $status"
+    if [ "$status" != "200" ] && [ "$status" != "204" ]; then
+        if command -v runpodctl >/dev/null 2>&1; then
+            runpodctl remove pod "$RUNPOD_POD_ID" || runpodctl stop pod "$RUNPOD_POD_ID"
+        fi
+    fi
+fi
+kill 1
+' >/root/selfkill.log 2>&1 &
 echo "self-kill armed: ${MAX} min (pod ${RUNPOD_POD_ID:-?}); runpodctl: $(command -v runpodctl || echo MISSING)"
 set -e
 export UV_HTTP_TIMEOUT=600 PIP_DEFAULT_TIMEOUT=600

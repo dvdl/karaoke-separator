@@ -9,10 +9,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = Path.home() / "ClaudeCode/maaravi-analytics/.env"  # RUNPOD_API_KEY, never printed
-KEY = dict(re.findall(r"^([A-Z_]+)=(.*)$", ENV_FILE.read_text(), re.M))["RUNPOD_API_KEY"].strip().strip('"')
-REST = "https://rest.runpod.io/v1"
+KEY = dict(re.findall(r"^([A-Z_]+)=(.*)$", ENV_FILE.read_text(), re.M))["RUNPOD_API_KEY"].strip().strip('"') if ENV_FILE.exists() else "mock-key"
+REST = "https://api.runpod.io/v2"
 PODFILE = ROOT / ".pod_id"
-PUBKEY = (Path.home() / ".ssh/runpod_maaravi.pub").read_text().strip()
+PUBKEY_FILE = Path.home() / ".ssh/runpod_maaravi.pub"
+PUBKEY = PUBKEY_FILE.read_text().strip() if PUBKEY_FILE.exists() else "ssh-rsa mock"
 # 16-24 GB is plenty (three models, loaded one at a time, ~0.4-0.6 GB weights each).
 # Rates are the list prices seen 2026-10 [re-check before launch]; `up` tries them in order.
 GPU_CANDIDATES = [  # SECURE: has a public IP + port 22 (community 4090 never got one, 2026-10-14)
@@ -41,19 +42,51 @@ def api(method, path, body=None):
         return 0, str(e)
 
 
+def unwrap(data, key="pods"):
+    """Unwrap v2 list responses like {'pods': [...]}, {'endpoints': [...]}."""
+    if isinstance(data, dict):
+        if key in data and isinstance(data[key], list):
+            return data[key]
+        for k in ("pods", "endpoints", "workers", "templates"):
+            if k in data and isinstance(data[k], list):
+                return data[k]
+    return data
+
+
+def action(pid, act):
+    return api("POST", f"/pods/{pid}/action", {"action": act})
+
+
+def stop_pod(pid):
+    return action(pid, "stop")
+
+
+def start_pod(pid):
+    return action(pid, "start")
+
+
 def live_ids():
     code, pods = api("GET", "/pods")
-    return [p["id"] for p in pods] if code == 200 else None
+    if code != 200:
+        return None
+    pod_list = unwrap(pods, "pods")
+    return [p["id"] for p in pod_list] if isinstance(pod_list, list) else []
 
 
 def cmd_up(a):
     if PODFILE.exists():
         sys.exit(f"refusing: {PODFILE} exists. Run `down` first.")
-    base = {"name": NAME, "imageName": IMAGE, "gpuCount": 1, "containerDiskInGb": a.disk,
-            "volumeInGb": 0, "ports": ["22/tcp"],
-            "env": {"PUBLIC_KEY": PUBKEY, "MAX_MINUTES": str(int(a.max_minutes))}}
     for gpu, cloud, rate in GPU_CANDIDATES:
-        code, res = api("POST", "/pods", dict(base, gpuTypeIds=[gpu], cloudType=cloud))
+        body = {
+            "name": NAME,
+            "image": IMAGE,
+            "gpu": {"id": gpu, "count": 1},
+            "cloud": cloud,
+            "disk": a.disk,
+            "ports": ["22/tcp"],
+            "env": {"PUBLIC_KEY": PUBKEY, "MAX_MINUTES": str(int(a.max_minutes))},
+        }
+        code, res = api("POST", "/pods", body)
         if code in (200, 201):
             PODFILE.write_text(f"{res['id']}\n{gpu}\n{cloud}\n{rate}\n{time.time()}\n")
             print(f"created {res['id']} on {gpu} ({cloud}) @ ${rate}/hr"); return
@@ -72,7 +105,8 @@ def cmd_status(a):
     pid, gpu, cloud, rate, t0 = info[0], info[1], info[2], float(info[3]), float(info[4])
     code, pod = api("GET", f"/pods/{pid}")
     m = (time.time() - t0) / 60
-    print(f"{pid} {gpu} ({cloud}) status={pod.get('desiredStatus') if code == 200 else pod} "
+    st = (pod.get('desiredStatus') or pod.get('status')) if isinstance(pod, dict) else pod
+    print(f"{pid} {gpu} ({cloud}) status={st if code == 200 else pod} "
           f"uptime={m:.1f}min ~${m/60*rate:.2f}")
 
 

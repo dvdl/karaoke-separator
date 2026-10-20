@@ -7,7 +7,8 @@ import base64, json, re, sys, time, urllib.error, urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-KEY = dict(re.findall(r"^([A-Z_]+)=(.*)$", (Path.home() / "ClaudeCode/maaravi-analytics/.env").read_text(), re.M))["RUNPOD_API_KEY"].strip().strip('"')
+ENV_FILE = Path.home() / "ClaudeCode/maaravi-analytics/.env"
+KEY = dict(re.findall(r"^([A-Z_]+)=(.*)$", ENV_FILE.read_text(), re.M))["RUNPOD_API_KEY"].strip().strip('"') if ENV_FILE.exists() else "mock-key"
 IDFILE = ROOT / ".endpoint_id"
 IMAGE = "ghcr.io/dvdl/karaoke-separator:b5c0e162452d123bd5af4a48c7a77cb1d0cd5f90"
 GPUS = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090", "NVIDIA RTX A5000",
@@ -19,6 +20,7 @@ POOLS = ["ADA_24", "AMPERE_24", "AMPERE_16"]
 EXCLUDE = ["NVIDIA RTX 2000 Ada Generation", "NVIDIA RTX 4000 Ada Generation", "NVIDIA RTX A4000",
            "NVIDIA RTX PRO 6000 Blackwell Server Edition MIG 1g.24gb"]
 UA = "karaoke-separator-admin/1.0"   # Python's default UA gets Cloudflare 1010
+REST_BASE = "https://api.runpod.io/v2"
 
 
 def call(method, url, body=None, timeout=60):
@@ -31,20 +33,35 @@ def call(method, url, body=None, timeout=60):
         return e.code, e.read().decode()[:400]
 
 
-rest = lambda m, p, b=None: call(m, "https://rest.runpod.io/v1" + p, b)
+rest = lambda m, p, b=None: call(m, REST_BASE + p, b)
 eid = lambda: IDFILE.read_text().split()[0]
+
+
+def unwrap(data, key=None):
+    """Unwrap v2 list responses like {'endpoints': [...]}, {'workers': [...]}, {'templates': [...]}."""
+    if isinstance(data, dict):
+        if key and key in data and isinstance(data[key], list):
+            return data[key]
+        for k in ("endpoints", "workers", "templates", "pods"):
+            if k in data and isinstance(data[k], list):
+                return data[k]
+    return data
 
 
 def create():
     if IDFILE.exists():
         sys.exit(f"exists: {eid()}")
-    c, t = rest("POST", "/templates", {"name": "karaoke-separator-deux", "imageName": IMAGE, "isServerless": True,
-                                       "containerDiskInGb": 15, "env": {}})
+    c, t = rest("POST", "/templates", {"name": "karaoke-separator-deux", "image": IMAGE, "isServerless": True,
+                                       "disk": 15, "env": {}})
     print("template", c, t.get("id") if isinstance(t, dict) else t)
     if c not in (200, 201): sys.exit(1)
-    c, e = rest("POST", "/endpoints", {"name": "karaoke-separator-deux", "templateId": t["id"], "gpuTypeIds": GPUS,
-                                       "gpuCount": 1, "workersMin": 0, "workersMax": 1, "idleTimeout": 5,
-                                       "executionTimeoutMs": 300000, "flashboot": True, "minCudaVersion": "12.8"})
+    c, e = rest("POST", "/serverless", {
+        "name": "karaoke-separator-deux",
+        "templateId": t["id"],
+        "gpu": {"pools": POOLS, "excludedTypes": EXCLUDE, "count": 1},
+        "workers": {"min": 0, "max": 1, "idleTimeout": 5},
+        "scaling": {"type": "QUEUE_DELAY", "queueDelay": 4},
+    })
     print("endpoint", c, e.get("id") if isinstance(e, dict) else e)
     if c not in (200, 201): sys.exit(1)
     IDFILE.write_text(f"{e['id']} {t['id']}\n")
@@ -52,23 +69,37 @@ def create():
 
 
 def status():
-    c, e = rest("GET", f"/endpoints/{eid()}?includeWorkers=true")
-    print({k: e.get(k) for k in ("id", "workersMin", "workersMax", "idleTimeout", "executionTimeoutMs")} if c == 200 else e)
-    print("workers:", [(w.get("id"), w.get("desiredStatus")) for w in (e.get("workers") or [])] if c == 200 else "?")
+    c, e = rest("GET", f"/serverless/{eid()}")
+    if c == 200 and isinstance(e, dict):
+        w_cfg = e.get("workers") if isinstance(e.get("workers"), dict) else {}
+        w_min = e["workersMin"] if "workersMin" in e else w_cfg.get("min")
+        w_max = e["workersMax"] if "workersMax" in e else w_cfg.get("max")
+        idle = e["idleTimeout"] if "idleTimeout" in e else w_cfg.get("idleTimeout")
+        exec_t = e["executionTimeoutMs"] if "executionTimeoutMs" in e else e.get("executionTimeout")
+        print({
+            "id": e.get("id"),
+            "workersMin": w_min,
+            "workersMax": w_max,
+            "idleTimeout": idle,
+            "executionTimeoutMs": exec_t,
+        })
+    else:
+        print(e)
+    cw, w = rest("GET", f"/serverless/{eid()}/workers")
+    workers = unwrap(w, "workers")
+    print("workers:", [(x.get("id"), x.get("desiredStatus")) for x in (workers or [])] if cw == 200 else "?")
     c, h = call("GET", f"https://api.runpod.ai/v2/{eid()}/health"); print("health", h)
 
 
 def setmax(n):
-    c, e = rest("PATCH", f"/endpoints/{eid()}", {"workersMax": n}); print("workersMax ->", n, c)
+    c, e = rest("PATCH", f"/serverless/{eid()}", {"workers": {"max": n}}); print("workersMax ->", n, c)
 
 
 def gpus():
-    ids = ",".join(POOLS + ["-" + g for g in EXCLUDE])
-    q = "mutation($i:EndpointInput!){saveEndpoint(input:$i){id gpuIds workersMax workersMin idleTimeout}}"
-    c, r = call("POST", "https://api.runpod.io/graphql", {"query": q, "variables": {"i": {
-        "id": eid(), "name": "karaoke-separator-deux", "templateId": IDFILE.read_text().split()[1], "gpuIds": ids,
-        "gpuCount": 1, "workersMin": 0, "workersMax": 1, "idleTimeout": 5, "scalerType": "QUEUE_DELAY",
-        "scalerValue": 4, "flashBootType": "FLASHBOOT"}}})
+    c, r = rest("PATCH", f"/serverless/{eid()}", {
+        "gpu": {"pools": POOLS, "excludedTypes": EXCLUDE, "count": 1},
+        "scaling": {"type": "QUEUE_DELAY", "queueDelay": 4},
+    })
     print(c, r)
 
 
