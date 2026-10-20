@@ -18,3 +18,18 @@ see `handler.py`. `ab/` holds the scripts of the 2026-10-14 A/B run (short-lived
 - Licence: has **NO stated licence** for its weights -> private/personal use only, not redistributed, fetched at cold start.
 - GPU pool: the endpoint is pinned to the `AMPERE_24` pool (RTX 3090/A5000/L4) because "-<MIG type>" pool exclusions were not honoured on 2026-10-14, and the handler refuses MIG as a second guard.
 
+
+## Runpod API v2 migration (2026-10-20)
+
+REST v1 (rest.runpod.io/v1) is retired 2026-11-15; GraphQL is rate-limited from 2026-10-27 and stops in January 2027.
+`endpoint.py`, `ab/pod.py` and `ab/pod_setup.sh` use REST v2 (`https://api.runpod.io/v2`).
+
+The untracked one-off scripts in the main checkout are **marked for retirement**; do not use them after 2026-11-15:
+
+| Script | Uses | Replacement |
+|---|---|---|
+| `ep6.py` `bal` | GraphQL `myself.clientBalance` | `runpodctl user` or the console (no v2 balance endpoint) |
+| `ep6.py` `tmpl` / `image` / `scale` | v1 field names (`imageName`, `/endpoints`, `workersMax`) via `endpoint.py` | `GET`/`PATCH /v2/templates/{id}` with `image`; `endpoint.py on/off` |
+| `ep6gpus.py` | GraphQL `saveEndpoint gpuIds` | `endpoint.py gpus` (v2 `gpu.pools` + `excludedTypes`) |
+| `ep6probe.py` | GraphQL `myself`/`endpoints`/`gpuTypes` | `endpoint.py status`, `GET /v2/catalog/gpus` |
+| `ab/work/six/ep6.py`, `ab/work/rearm.sh` (git-ignored scratch) | copy of ep6 / runpodctl self-kill | `ab/pod_setup.sh` |
