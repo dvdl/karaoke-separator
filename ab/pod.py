@@ -9,11 +9,27 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = Path.home() / "ClaudeCode/maaravi-analytics/.env"  # RUNPOD_API_KEY, never printed
-KEY = dict(re.findall(r"^([A-Z_]+)=(.*)$", ENV_FILE.read_text(), re.M))["RUNPOD_API_KEY"].strip().strip('"') if ENV_FILE.exists() else "mock-key"
+PUBKEY_FILE = Path.home() / ".ssh/runpod_maaravi.pub"
 REST = "https://api.runpod.io/v2"
 PODFILE = ROOT / ".pod_id"
-PUBKEY_FILE = Path.home() / ".ssh/runpod_maaravi.pub"
-PUBKEY = PUBKEY_FILE.read_text().strip() if PUBKEY_FILE.exists() else "ssh-rsa mock"
+
+
+def get_key():
+    return dict(re.findall(r"^([A-Z_]+)=(.*)$", ENV_FILE.read_text(), re.M))["RUNPOD_API_KEY"].strip().strip('"')
+
+
+def get_pubkey():
+    return PUBKEY_FILE.read_text().strip()
+
+
+def __getattr__(name):
+    if name == "KEY":
+        return get_key()
+    if name == "PUBKEY":
+        return get_pubkey()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # 16-24 GB is plenty (three models, loaded one at a time, ~0.4-0.6 GB weights each).
 # Rates are the list prices seen 2026-10 [re-check before launch]; `up` tries them in order.
 GPU_CANDIDATES = [  # SECURE: has a public IP + port 22 (community 4090 never got one, 2026-10-14)
@@ -28,16 +44,45 @@ NAME = "karaoke-ab"
 UA = "karaoke-ab-launcher/1.0"   # Python's default UA gets Cloudflare 1010
 
 
+def format_error(data):
+    """Format RFC 9457 Problem Details or other error responses."""
+    if isinstance(data, dict):
+        title = data.get("title")
+        detail = data.get("detail")
+        status = data.get("status")
+        errors = data.get("errors")
+        if title or detail or status:
+            parts = []
+            if status:
+                parts.append(f"[{status}]")
+            if title:
+                parts.append(title)
+            if detail:
+                parts.append(f"- {detail}" if parts else detail)
+            if errors and isinstance(errors, list):
+                parts.append(f"({'; '.join(str(e) for e in errors)})")
+            return " ".join(parts)
+    return str(data)
+
+
 def api(method, path, body=None):
     req = urllib.request.Request(f"{REST}{path}", method=method,
         data=json.dumps(body).encode() if body else None,
-        headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json", "User-Agent": UA})
+        headers={"Authorization": f"Bearer {get_key()}", "Content-Type": "application/json", "User-Agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=60) as r:
             raw = r.read().decode()
-            return r.status, (json.loads(raw) if raw.strip() else {})
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                data = raw
+            return r.status, data
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()[:300]
+        raw = e.read().decode()
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw[:300]
     except Exception as e:  # network blip: let callers retry
         return 0, str(e)
 
@@ -84,13 +129,14 @@ def cmd_up(a):
             "cloud": cloud,
             "disk": a.disk,
             "ports": ["22/tcp"],
-            "env": {"PUBLIC_KEY": PUBKEY, "MAX_MINUTES": str(int(a.max_minutes))},
+            "env": {"PUBLIC_KEY": get_pubkey(), "MAX_MINUTES": str(int(a.max_minutes))},
         }
         code, res = api("POST", "/pods", body)
         if code in (200, 201):
             PODFILE.write_text(f"{res['id']}\n{gpu}\n{cloud}\n{rate}\n{time.time()}\n")
             print(f"created {res['id']} on {gpu} ({cloud}) @ ${rate}/hr"); return
-        print(f"  {gpu:<28} {cloud:<9} -> {code} {str(res)[:90]}")
+        err_msg = format_error(res)
+        print(f"  {gpu:<28} {cloud:<9} -> {code} {err_msg[:90]}")
     sys.exit("no capacity on any candidate GPU")
 
 
@@ -105,8 +151,8 @@ def cmd_status(a):
     pid, gpu, cloud, rate, t0 = info[0], info[1], info[2], float(info[3]), float(info[4])
     code, pod = api("GET", f"/pods/{pid}")
     m = (time.time() - t0) / 60
-    st = (pod.get('desiredStatus') or pod.get('status')) if isinstance(pod, dict) else pod
-    print(f"{pid} {gpu} ({cloud}) status={st if code == 200 else pod} "
+    st = (pod.get('status') or pod.get('desiredStatus')) if (code == 200 and isinstance(pod, dict)) else format_error(pod)
+    print(f"{pid} {gpu} ({cloud}) status={st} "
           f"uptime={m:.1f}min ~${m/60*rate:.2f}")
 
 
@@ -115,7 +161,9 @@ def cmd_down(a):
     if not pid:
         print("nothing to terminate; live pods:", live_ids()); return
     for attempt in range(5):
-        code, _ = api("DELETE", f"/pods/{pid}"); print(f"DELETE {pid} -> {code}")
+        code, res = api("DELETE", f"/pods/{pid}")
+        err_str = f" ({format_error(res)})" if code not in (200, 204) else ""
+        print(f"DELETE {pid} -> {code}{err_str}")
         time.sleep(5)
         live = live_ids()
         if live is not None and pid not in live:
@@ -133,8 +181,9 @@ def cmd_sshcfg(a):
     pid = (read_pod() or [a.pod_id])[0]
     for _ in range(60):
         code, pod = api("GET", f"/pods/{pid}")
-        ip = (pod or {}).get("publicIp") if code == 200 else None
-        port = ((pod or {}).get("portMappings") or {}).get("22") if code == 200 else None
+        ssh_direct = (pod.get("ssh") or {}).get("direct") if (code == 200 and isinstance(pod, dict)) else None
+        ip = ssh_direct.get("host") if ssh_direct else ((pod or {}).get("publicIp") if code == 200 else None)
+        port = ssh_direct.get("port") if ssh_direct else (((pod or {}).get("portMappings") or {}).get("22") if code == 200 else None)
         if ip and port:
             cfg = ROOT / "work/ssh_cfg"; cfg.parent.mkdir(exist_ok=True)
             cfg.write_text(f"Host pod\n  HostName {ip}\n  Port {port}\n  User root\n"

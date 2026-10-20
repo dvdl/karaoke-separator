@@ -8,7 +8,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 ENV_FILE = Path.home() / "ClaudeCode/maaravi-analytics/.env"
-KEY = dict(re.findall(r"^([A-Z_]+)=(.*)$", ENV_FILE.read_text(), re.M))["RUNPOD_API_KEY"].strip().strip('"') if ENV_FILE.exists() else "mock-key"
+
+
+def get_key():
+    return dict(re.findall(r"^([A-Z_]+)=(.*)$", ENV_FILE.read_text(), re.M))["RUNPOD_API_KEY"].strip().strip('"')
+
+
+def __getattr__(name):
+    if name == "KEY":
+        return get_key()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 IDFILE = ROOT / ".endpoint_id"
 IMAGE = "ghcr.io/dvdl/karaoke-separator:b5c0e162452d123bd5af4a48c7a77cb1d0cd5f90"
 GPUS = ["NVIDIA GeForce RTX 4090", "NVIDIA GeForce RTX 3090", "NVIDIA RTX A5000",
@@ -23,14 +34,44 @@ UA = "karaoke-separator-admin/1.0"   # Python's default UA gets Cloudflare 1010
 REST_BASE = "https://api.runpod.io/v2"
 
 
+def format_error(data):
+    """Format RFC 9457 Problem Details or other error responses."""
+    if isinstance(data, dict):
+        title = data.get("title")
+        detail = data.get("detail")
+        status = data.get("status")
+        errors = data.get("errors")
+        if title or detail or status:
+            parts = []
+            if status:
+                parts.append(f"[{status}]")
+            if title:
+                parts.append(title)
+            if detail:
+                parts.append(f"- {detail}" if parts else detail)
+            if errors and isinstance(errors, list):
+                parts.append(f"({'; '.join(str(e) for e in errors)})")
+            return " ".join(parts)
+    return str(data)
+
+
 def call(method, url, body=None, timeout=60):
     req = urllib.request.Request(url, method=method, data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Authorization": f"Bearer {KEY}", "Content-Type": "application/json", "User-Agent": UA})
+                                 headers={"Authorization": f"Bearer {get_key()}", "Content-Type": "application/json", "User-Agent": UA})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            raw = r.read().decode(); return r.status, (json.loads(raw) if raw.strip() else {})
+            raw = r.read().decode()
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except Exception:
+                data = raw
+            return r.status, data
     except urllib.error.HTTPError as e:
-        return e.code, e.read().decode()[:400]
+        raw = e.read().decode()
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, raw[:400]
 
 
 rest = lambda m, p, b=None: call(m, REST_BASE + p, b)
@@ -51,18 +92,27 @@ def unwrap(data, key=None):
 def create():
     if IDFILE.exists():
         sys.exit(f"exists: {eid()}")
-    c, t = rest("POST", "/templates", {"name": "karaoke-separator-deux", "image": IMAGE, "isServerless": True,
-                                       "disk": 15, "env": {}})
-    print("template", c, t.get("id") if isinstance(t, dict) else t)
+    c, t = rest("POST", "/templates", {
+        "name": "karaoke-separator-deux",
+        "image": IMAGE,
+        "serverless": True,
+        "startJupyter": False,
+        "disk": 15,
+        "env": {},
+    })
+    print("template", c, t.get("id") if (isinstance(t, dict) and "id" in t and c in (200, 201)) else format_error(t))
     if c not in (200, 201): sys.exit(1)
     c, e = rest("POST", "/serverless", {
         "name": "karaoke-separator-deux",
+        "type": "QUEUE",
         "templateId": t["id"],
-        "gpu": {"pools": POOLS, "excludedTypes": EXCLUDE, "count": 1},
+        "gpu": {"pools": POOLS, "excludedTypes": EXCLUDE, "count": 1, "minCudaVersion": "12.8"},
         "workers": {"min": 0, "max": 1, "idleTimeout": 5},
         "scaling": {"type": "QUEUE_DELAY", "queueDelay": 4},
+        "timeout": 300000,
+        "flashboot": "FLASHBOOT",
     })
-    print("endpoint", c, e.get("id") if isinstance(e, dict) else e)
+    print("endpoint", c, e.get("id") if (isinstance(e, dict) and "id" in e and c in (200, 201)) else format_error(e))
     if c not in (200, 201): sys.exit(1)
     IDFILE.write_text(f"{e['id']} {t['id']}\n")
     gpus()
@@ -72,10 +122,10 @@ def status():
     c, e = rest("GET", f"/serverless/{eid()}")
     if c == 200 and isinstance(e, dict):
         w_cfg = e.get("workers") if isinstance(e.get("workers"), dict) else {}
-        w_min = e["workersMin"] if "workersMin" in e else w_cfg.get("min")
-        w_max = e["workersMax"] if "workersMax" in e else w_cfg.get("max")
-        idle = e["idleTimeout"] if "idleTimeout" in e else w_cfg.get("idleTimeout")
-        exec_t = e["executionTimeoutMs"] if "executionTimeoutMs" in e else e.get("executionTimeout")
+        w_min = w_cfg.get("min") if "min" in w_cfg else e.get("workersMin")
+        w_max = w_cfg.get("max") if "max" in w_cfg else e.get("workersMax")
+        idle = w_cfg.get("idleTimeout") if "idleTimeout" in w_cfg else e.get("idleTimeout")
+        exec_t = e.get("timeout") if "timeout" in e else (e.get("executionTimeoutMs") or e.get("executionTimeout"))
         print({
             "id": e.get("id"),
             "workersMin": w_min,
@@ -84,23 +134,26 @@ def status():
             "executionTimeoutMs": exec_t,
         })
     else:
-        print(e)
+        print(format_error(e))
     cw, w = rest("GET", f"/serverless/{eid()}/workers")
     workers = unwrap(w, "workers")
-    print("workers:", [(x.get("id"), x.get("desiredStatus")) for x in (workers or [])] if cw == 200 else "?")
-    c, h = call("GET", f"https://api.runpod.ai/v2/{eid()}/health"); print("health", h)
+    print("workers:", [(x.get("id"), x.get("status") or x.get("desiredStatus")) for x in (workers or [])] if cw == 200 else format_error(w))
+    c, h = call("GET", f"https://api.runpod.ai/v2/{eid()}/health"); print("health", h if c == 200 else format_error(h))
 
 
 def setmax(n):
-    c, e = rest("PATCH", f"/serverless/{eid()}", {"workers": {"max": n}}); print("workersMax ->", n, c)
+    c, e = rest("PATCH", f"/serverless/{eid()}", {"workers": {"max": n}})
+    print("workersMax ->", n, c if c in (200, 204) else f"{c} {format_error(e)}")
 
 
 def gpus():
     c, r = rest("PATCH", f"/serverless/{eid()}", {
         "gpu": {"pools": POOLS, "excludedTypes": EXCLUDE, "count": 1},
         "scaling": {"type": "QUEUE_DELAY", "queueDelay": 4},
+        "workers": {"min": 0, "max": 1, "idleTimeout": 5},
+        "flashboot": "FLASHBOOT",
     })
-    print(c, r)
+    print(c, r if c in (200, 204) else format_error(r))
 
 
 def test(path):
