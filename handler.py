@@ -1,16 +1,28 @@
-"""Runpod serverless worker: becruily deux (Mel-Band RoFormer) vocal/instrumental separation.
+"""Runpod serverless worker: vocal/instrumental separation and vocsplit (lead/backing vocals).
 
-The weights are NOT in the image (CC-BY-NC-4.0, not ours to republish): they are fetched
-from Hugging Face once per cold start, before the worker takes jobs, so FlashBoot snapshots
-a loaded model.
+The main model weights are NOT in the image (CC-BY-NC-4.0 or no stated licence for sw6):
+they are fetched from Hugging Face once per cold start, before the worker takes jobs, so
+FlashBoot snapshots a loaded model.
 
-Input  {"audio_url": "https://..."}  or  {"audio_b64": "<base64 audio>"}
-       optional "upload": {"instrumental": PUT url, "vocals": PUT url}
-         (song-length stems exceed Runpod's payload limit; the site hands out signed URLs)
-Output {"model": "becruily-deux", "gpu": str, "audio_seconds": float, "separate_seconds": float,
-        "instrumental_b64"/"vocals_b64" (FLAC) unless uploaded, "uploaded": bool}
+Vocsplit model weights (becruily karaoke Mel-Band RoFormer) have no stated licence -> not
+baked into the image, fetched at first use on demand (lazily loaded on first vocsplit job).
+
+Tasks:
+- default (no "task" or task == "separate"):
+    Input  {"audio_url": "https://..."}  or  {"audio_b64": "<base64 audio>"}
+           optional "upload": {"instrumental": PUT url, "vocals": PUT url}
+             (song-length stems exceed Runpod's payload limit; the site hands out signed URLs)
+    Output {"model": str, "gpu": str, "audio_seconds": float, "separate_seconds": float,
+            "instrumental_b64"/"vocals_b64" or 6 stems (FLAC) unless uploaded, "uploaded": bool}
+
+- "vocsplit" (lead vs backing vocal separation for karaoke):
+    Input  {"task": "vocsplit", "audio_b64": "<base64 audio>"}  (audio_url also accepted)
+    Output {"task": "vocsplit", "model": "becruily-karaoke", "gpu": str,
+            "audio_seconds": float, "separate_seconds": float,
+            "load_seconds": float, "lead_b64": "<base64 FLAC PCM_24>",
+            "backing_b64": "<base64 FLAC PCM_24>"}
 """
-import base64, os, shutil, tempfile, time, urllib.request
+import base64, os, shutil, tempfile, threading, time, urllib.request
 
 import soundfile as sf
 import torch
@@ -40,6 +52,19 @@ CKPT, YAML = M["ckpt"], M["yaml"]
 UA = {"User-Agent": "karaoke-separator/1.0"}
 OUT = "/tmp/sep_out"
 
+# Vocsplit configuration: Mel-Band RoFormer karaoke (lead vs backing vocal separation)
+# NO stated licence for weights -> private/personal use only, not baked into the image, fetched at first use
+VOCSPLIT_LABEL = "becruily-karaoke"
+VOCSPLIT_CKPT = "mel_band_roformer_karaoke_becruily.ckpt"
+VOCSPLIT_YAML = "config_karaoke_becruily.yaml"
+VOCSPLIT_URLS = (
+    "https://huggingface.co/becruily/mel-band-roformer-karaoke/resolve/main/mel_band_roformer_karaoke_becruily.ckpt",
+    "https://huggingface.co/becruily/mel-band-roformer-karaoke/resolve/main/config_karaoke_becruily.yaml",
+)
+VOCSPLIT_OUT = "/tmp/vocsplit_out"
+VOCSPLIT_SEP = None
+_vocsplit_lock = threading.Lock()
+
 
 def fetch(url, dst, timeout=600):
     tmp = dst + ".part"
@@ -65,12 +90,58 @@ def load():
     return s
 
 
+def get_vocsplit_separator():
+    global VOCSPLIT_SEP
+    if VOCSPLIT_SEP is not None:
+        return VOCSPLIT_SEP, 0
+    with _vocsplit_lock:
+        if VOCSPLIT_SEP is not None:
+            return VOCSPLIT_SEP, 0
+        t0 = time.time()
+        os.makedirs(MODEL_DIR, exist_ok=True)
+        for name, src in zip((VOCSPLIT_CKPT, VOCSPLIT_YAML), VOCSPLIT_URLS):
+            p = os.path.join(MODEL_DIR, name)
+            if not os.path.exists(p):
+                fetch(src, p)
+        t_dl = time.time() - t0
+        s = Separator(model_file_dir=MODEL_DIR, output_dir=VOCSPLIT_OUT, output_format="FLAC")
+        s.download_model_files = lambda f: (
+            VOCSPLIT_CKPT,
+            "MDXC",
+            VOCSPLIT_LABEL,
+            os.path.join(MODEL_DIR, VOCSPLIT_CKPT),
+            VOCSPLIT_YAML,
+        )
+        s.load_model(VOCSPLIT_CKPT)
+        load_seconds = round(time.time() - t0, 2)
+        VOCSPLIT_SEP = s
+        print(f"vocsplit model ready: download {t_dl:.1f}s, total {load_seconds:.1f}s, "
+              f"cuda={torch.cuda.is_available()}", flush=True)
+        return VOCSPLIT_SEP, load_seconds
+
+
+def map_vocsplit_stems(files, out_dir=VOCSPLIT_OUT):
+    lead_path, backing_path = None, None
+    for f in files:
+        p = f if os.path.isabs(f) else os.path.join(out_dir, f)
+        b = os.path.basename(p).lower()
+        if "(vocals)" in b:
+            lead_path = p
+        elif "(instrumental)" in b:
+            backing_path = p
+    return lead_path, backing_path
+
+
 GPU = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu"
 if is_mig(GPU):
     print(f"refused: MIG GPU {GPU}", flush=True)
     SEP = None
 else:
-    SEP = load()
+    try:
+        SEP = load()
+    except Exception as e:
+        print(f"load() failed at import: {e}", flush=True)
+        SEP = None
 
 
 def put(url, path):
@@ -83,10 +154,7 @@ def put(url, path):
             raise RuntimeError(f"upload {r.status}")
 
 
-def handler(job):
-    if is_mig(GPU):
-        return {"error": f"refused: MIG GPU {GPU}", "refused_gpu": GPU, "gpu": GPU}
-    inp = job.get("input") or {}
+def _handle_separate(inp):
     work = tempfile.mkdtemp(prefix="job_")
     shutil.rmtree(OUT, ignore_errors=True); os.makedirs(OUT)
     try:
@@ -102,6 +170,8 @@ def handler(job):
             info = sf.info(src)
         except Exception:
             info = None
+        if SEP is None:
+            return {"error": "separator not loaded"}
         t = time.time()
         files = SEP.separate(src)
         dt = time.time() - t
@@ -139,5 +209,67 @@ def handler(job):
         shutil.rmtree(OUT, ignore_errors=True)
 
 
+def _handle_vocsplit(inp):
+    work = tempfile.mkdtemp(prefix="job_vocsplit_")
+    shutil.rmtree(VOCSPLIT_OUT, ignore_errors=True)
+    os.makedirs(VOCSPLIT_OUT, exist_ok=True)
+    try:
+        src = os.path.join(work, "input")
+        if inp.get("audio_url"):
+            fetch(inp["audio_url"], src)
+        elif inp.get("audio_b64"):
+            with open(src, "wb") as f:
+                f.write(base64.b64decode(inp["audio_b64"]))
+        else:
+            return {"error": "need audio_url or audio_b64"}
+        try:
+            info = sf.info(src)
+        except Exception:
+            info = None
+        sep, load_seconds = get_vocsplit_separator()
+        t = time.time()
+        files = sep.separate(src)
+        dt = time.time() - t
+        lead_path, backing_path = map_vocsplit_stems(files, VOCSPLIT_OUT)
+        if not lead_path or not backing_path:
+            return {"error": f"unexpected stems: {[os.path.basename(f) for f in files]}"}
+        for p in (lead_path, backing_path):
+            d, sr = sf.read(p, dtype="float32")
+            sf.write(p, d, sr, format="FLAC", subtype="PCM_24")
+        with open(lead_path, "rb") as f:
+            lead_b64 = base64.b64encode(f.read()).decode()
+        with open(backing_path, "rb") as f:
+            backing_b64 = base64.b64encode(f.read()).decode()
+        return {
+            "task": "vocsplit",
+            "model": VOCSPLIT_LABEL,
+            "gpu": GPU,
+            "audio_seconds": round(info.duration, 2) if info else None,
+            "separate_seconds": round(dt, 2),
+            "load_seconds": load_seconds,
+            "lead_b64": lead_b64,
+            "backing_b64": backing_b64,
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+        shutil.rmtree(VOCSPLIT_OUT, ignore_errors=True)
+
+
+def handler(job):
+    if is_mig(GPU):
+        return {"error": f"refused: MIG GPU {GPU}", "refused_gpu": GPU, "gpu": GPU}
+    inp = (job or {}).get("input") or {}
+    task = inp.get("task")
+    if task is None or task == "separate":
+        return _handle_separate(inp)
+    elif task == "vocsplit":
+        return _handle_vocsplit(inp)
+    else:
+        return {"error": f"unknown task: {task}"}
+
+
 if __name__ == "__main__":
     runpod.serverless.start({"handler": handler})
+

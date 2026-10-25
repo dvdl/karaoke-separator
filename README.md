@@ -18,6 +18,13 @@ see `handler.py`. `ab/` holds the scripts of the 2026-10-14 A/B run (short-lived
 - Licence: has **NO stated licence** for its weights -> private/personal use only, not redistributed, fetched at cold start.
 - GPU pool: the endpoint is pinned to the `AMPERE_24` pool (RTX 3090/A5000/L4) because "-<MIG type>" pool exclusions were not honoured on 2026-10-14, and the handler refuses MIG as a second guard.
 
+## vocsplit (lead / backing vocal separation)
+
+- Model: becruily Mel-Band RoFormer Karaoke ([becruily/mel-band-roformer-karaoke](https://huggingface.co/becruily/mel-band-roformer-karaoke)).
+- Licence: has **NO stated licence** for its weights -> private/personal use only, not baked into the image, fetched at first use on demand.
+- Task: `{"task": "vocsplit", "audio_b64": "<base64 FLAC>"}` (also accepts `audio_url`).
+- Output: `{"task": "vocsplit", "model": "becruily-karaoke", "gpu": str, "audio_seconds": float, "separate_seconds": float, "load_seconds": float, "lead_b64": str, "backing_b64": str}` (both stems FLAC PCM_24).
+
 
 ## Runpod API v2 migration (2026-10-20)
 
